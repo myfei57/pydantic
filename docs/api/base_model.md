@@ -19,6 +19,7 @@ Pydantic models are simply classes which inherit from `BaseModel` and define fie
           - model_dump
           - model_dump_json
           - model_json_schema
+          - model_serialization_field_conflicts
           - model_parametrized_name
           - model_post_init
           - model_rebuild

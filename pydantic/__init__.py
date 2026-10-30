@@ -122,6 +122,7 @@ __all__ = (
     'AliasPath',
     # main
     'BaseModel',
+    'SerializationFieldConflict',
     'create_model',
     # network
     'AnyUrl',
@@ -293,6 +294,7 @@ _dynamic_imports: 'dict[str, tuple[str, str]]' = {
     'AliasPath': (__spec__.parent, '.aliases'),
     # main
     'BaseModel': (__spec__.parent, '.main'),
+    'SerializationFieldConflict': (__spec__.parent, '.main'),
     'create_model': (__spec__.parent, '.main'),
     # network
     'AnyUrl': (__spec__.parent, '.networks'),

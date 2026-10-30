@@ -6,6 +6,7 @@
 
 from __future__ import annotations as _annotations
 
+import dataclasses
 import operator
 import sys
 import threading
@@ -69,7 +70,7 @@ if TYPE_CHECKING:
     from .fields import ComputedFieldInfo, FieldInfo, ModelPrivateAttr
 
 
-__all__ = 'BaseModel', 'create_model'
+__all__ = 'BaseModel', 'SerializationFieldConflict', 'create_model'
 
 # Keep these type aliases available at runtime:
 TupleGenerator: TypeAlias = Generator[tuple[str, Any], None, None]
@@ -77,6 +78,28 @@ TupleGenerator: TypeAlias = Generator[tuple[str, Any], None, None]
 # type inference (e.g. when using `{'a': {'b': True}}`):
 # NOTE: Keep this type alias in sync with the stub definition in `pydantic-core`:
 IncEx: TypeAlias = set[int] | set[str] | Mapping[int, Union['IncEx', bool]] | Mapping[str, Union['IncEx', bool]]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SerializationFieldConflict:
+    """A group of declared model fields that would be serialized to the same output key.
+
+    Returned by [`BaseModel.model_serialization_field_conflicts`][pydantic.BaseModel.model_serialization_field_conflicts].
+
+    Attributes:
+        output_key: The key under which the fields in the group are written when the model is serialized.
+        field_names: The names of every declared field that writes to `output_key`, in model field
+            declaration order (inherited fields included).
+        conditional_field_names: The subset of `field_names` configured with
+            [`Field(exclude_if=...)`][pydantic.Field]. These fields are reported conservatively: whether
+            they are actually emitted, and therefore whether the collision happens at runtime, depends on
+            the field value (the `exclude_if` callable is never executed by the check).
+    """
+
+    output_key: str
+    field_names: list[str]
+    conditional_field_names: list[str]
+
 
 _object_setattr = _model_construction.object_setattr
 
@@ -131,6 +154,63 @@ _SIMPLE_SETATTR_HANDLERS: Mapping[str, Callable[[BaseModel, str, Any], None]] = 
     'cached_property': lambda model, name, val: model.__dict__.__setitem__(name, val),  # pyright: ignore[reportAttributeAccessIssue] (https://github.com/microsoft/pyright/issues/11548)
     'extra_known': lambda model, name, val: _object_setattr(model, name, val),
 }
+
+
+def _serialization_field_conflicts(
+    fields: Mapping[str, FieldInfo], *, by_alias: bool
+) -> list[SerializationFieldConflict]:
+    """Group declared fields that would be written to the same serialization output key.
+
+    This only reads the final field configuration: it never instantiates the model and never calls
+    default factories, serializers or `Field(exclude_if=...)` callables.
+
+    Args:
+        fields: The model's final declared fields (`__pydantic_fields__`), in declaration order.
+        by_alias: Whether to use the final serialization alias (mirroring `model_dump(by_alias=True)`)
+            or the field name (mirroring `model_dump(by_alias=False)`).
+
+    Returns:
+        One `SerializationFieldConflict` per output key targeted by at least two distinct fields,
+        ordered by the first field targeting that key.
+    """
+    # Output key -> names of the fields writing to it (kept in field declaration order):
+    grouped_field_names: dict[str, list[str]] = {}
+    # Output key -> names of the subset of fields using `Field(exclude_if=...)`:
+    grouped_conditional_field_names: dict[str, list[str]] = {}
+
+    for field_name, field_info in fields.items():
+        # A field permanently excluded from serialization can never write an output key:
+        if field_info.exclude:
+            continue
+
+        if by_alias:
+            # Mirrors the key chosen by the serializer for `model_dump(by_alias=True)`: the final
+            # `serialization_alias` (which already incorporates an explicit `alias` and the configured
+            # alias generator), falling back to the field name when no alias is defined:
+            output_key = field_info.serialization_alias if field_info.serialization_alias is not None else field_name
+        else:
+            # Mirrors `model_dump(by_alias=False)`: the field name is always used as the output key:
+            output_key = field_name
+
+        field_names = grouped_field_names.setdefault(output_key, [])
+        # A field must never be reported as conflicting with itself:
+        if field_name not in field_names:
+            field_names.append(field_name)
+
+        if field_info.exclude_if is not None:
+            conditional_field_names = grouped_conditional_field_names.setdefault(output_key, [])
+            if field_name not in conditional_field_names:
+                conditional_field_names.append(field_name)
+
+    return [
+        SerializationFieldConflict(
+            output_key=output_key,
+            field_names=field_names,
+            conditional_field_names=grouped_conditional_field_names.get(output_key, []),
+        )
+        for output_key, field_names in grouped_field_names.items()
+        if len(field_names) > 1
+    ]
 
 
 class BaseModel(metaclass=_model_construction.ModelMetaclass):
@@ -310,6 +390,69 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
             Instead, you should access this attribute from the model class.
         """
         return getattr(cls, '__pydantic_computed_fields__', {})
+
+    @classmethod
+    def model_serialization_field_conflicts(cls, *, by_alias: bool) -> list[SerializationFieldConflict]:
+        """Detect declared fields that could be written to the same key during serialization.
+
+        This is a static inspection performed on the model's final field configuration, so it can be
+        used to spot collisions before any instance is ever exported. It does **not** instantiate the
+        model, does **not** call default factories, field/model serializers or
+        [`Field(exclude_if=...)`][pydantic.Field] callables, and never changes model construction or the
+        behavior of [`model_dump()`][pydantic.BaseModel.model_dump].
+
+        The output key each field is compared against is chosen explicitly:
+
+        - with `by_alias=False`, fields are keyed by their field name, mirroring
+          `model_dump(by_alias=False)`;
+        - with `by_alias=True`, fields are keyed by their final serialization alias (which already
+          incorporates an explicit [`alias`][pydantic.Field] and the configured
+          [alias generator][pydantic.config.ConfigDict.alias_generator]), falling back to the field
+          name, mirroring `model_dump(by_alias=True)`.
+
+        Scope: only the ordinary declared fields exposed in
+        [`model_fields`][pydantic.BaseModel.model_fields] (including inherited fields, and aliases
+        produced by an alias generator) are inspected. Runtime
+        [extra fields][pydantic.config.ConfigDict.extra],
+        [computed fields][pydantic.computed_field] and custom
+        [model serializers][pydantic.functional_serializers.model_serializer] are **not** taken into
+        account, so they cannot be reported here.
+
+        Fields permanently excluded with [`Field(exclude=True)`][pydantic.Field] never participate.
+        Fields configured with [`Field(exclude_if=...)`][pydantic.Field] participate conservatively and
+        are listed in
+        [`SerializationFieldConflict.conditional_field_names`][pydantic.SerializationFieldConflict]:
+        whether they are actually emitted, and therefore whether the collision happens at runtime,
+        depends on their value.
+
+        The conflicts, and the field names within each conflict, are reported in field declaration
+        order. A single field can never conflict with itself.
+
+        Args:
+            by_alias: If `True`, compare serialization aliases (as used by `model_dump(by_alias=True)`);
+                if `False`, compare field names (as used by `model_dump(by_alias=False)`).
+
+        Returns:
+            A list of [`SerializationFieldConflict`][pydantic.SerializationFieldConflict], one per
+            output key targeted by at least two fields, in field declaration order. An empty list is
+            returned when there are no conflicts.
+
+        Example:
+            ```python
+            from pydantic import BaseModel, Field
+
+            class User(BaseModel):
+                name: str = Field(serialization_alias='identifier')
+                identifier: int
+
+            conflicts = User.model_serialization_field_conflicts(by_alias=True)
+            print([c.field_names for c in conflicts])
+            #> [['name', 'identifier']]
+            print(User.model_serialization_field_conflicts(by_alias=False))
+            #> []
+            ```
+        """
+        return _serialization_field_conflicts(getattr(cls, '__pydantic_fields__', {}), by_alias=by_alias)
 
     @property
     def model_extra(self) -> Dict[str, Any] | None:  # noqa: UP006
