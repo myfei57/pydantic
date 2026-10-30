@@ -32,6 +32,7 @@ from pydantic_core import CoreSchema, PydanticOmit, PydanticUndefined, core_sche
 
 from pydantic import (
     AfterValidator,
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -1130,6 +1131,295 @@ def test_fields_set():
 
     m = MyModel(a=5, b=2)
     assert m.model_fields_set == {'a', 'b'}
+
+
+def test_fields_set_paths_basic():
+    class Inner(BaseModel):
+        x: int | None = None
+        y: int = 2
+        z: int = 3
+
+    class Outer(BaseModel):
+        a: int
+        b: Inner
+        c: int = 0
+
+    # Every explicitly set field yields a path, even when the value is `None`
+    # or equal to the default. Paths follow field declaration order.
+    assert Inner(x=None, y=2).model_fields_set_paths() == [('x',), ('y',)]
+
+    m = Outer(a=1, b=Inner(x=10))
+    assert m.model_fields_set_paths() == [
+        ('a',),
+        ('b',),
+        ('b', 'x'),
+    ]
+
+    # A model with only default values yields no paths.
+    assert Inner().model_fields_set_paths() == []
+    assert Outer(a=1, b=Inner()).model_fields_set_paths() == [('a',), ('b',)]
+
+    # A model without fields never yields paths.
+    class EmptyModel(BaseModel):
+        pass
+
+    assert EmptyModel().model_fields_set_paths() == []
+
+
+def test_fields_set_paths_nested_default():
+    class Inner(BaseModel):
+        x: int = 1
+        y: int = 2
+
+    # An unset field pointing to a fully default nested model yields nothing.
+    class DefaultNested(BaseModel):
+        inner: Inner = Inner()
+
+    assert DefaultNested().model_fields_set_paths() == []
+
+    # Fields explicitly set on a nested default value are still reported,
+    # even though the parent field itself was not explicitly set.
+    class FactoryNested(BaseModel):
+        inner: Inner = Field(default_factory=lambda: Inner(x=5))
+
+    assert FactoryNested().model_fields_set_paths() == [('inner', 'x')]
+
+    # The shared class-level default is copied during validation, so two instances
+    # do not leak explicitly set fields (or paths) into each other.
+    first = DefaultNested()
+    second = DefaultNested()
+    first.inner.x = 1
+    assert first.model_fields_set_paths() == [('inner', 'x')]
+    assert second.model_fields_set_paths() == []
+
+
+def test_fields_set_paths_lists_and_dicts():
+    class Inner(BaseModel):
+        x: int = 1
+        y: int = 2
+
+    class WithContainers(BaseModel):
+        items: list[Inner]
+        mapping: dict[str, Inner]
+        numbers: list[int] = []
+
+    m = WithContainers(
+        items=[Inner(x=10), Inner(y=20)],
+        mapping={'first': Inner(x=30), 'second': Inner(y=40)},
+        numbers=[1, 2],
+    )
+    # List items are addressed by integer index, dictionary entries by their raw
+    # string key; scalar leaves only produce the path of the field holding them.
+    assert m.model_fields_set_paths() == [
+        ('items',),
+        ('items', 0, 'x'),
+        ('items', 1, 'y'),
+        ('mapping',),
+        ('mapping', 'first', 'x'),
+        ('mapping', 'second', 'y'),
+        ('numbers',),
+    ]
+
+    # Dictionary entries with non-string keys are not traversed.
+    class IntKeyedDict(BaseModel):
+        value: dict = {}
+
+    assert IntKeyedDict(value={1: Inner(x=1)}).model_fields_set_paths() == [('value',)]
+
+    # Arbitrarily nested lists and string keyed dictionaries are traversed.
+    class NestedContainers(BaseModel):
+        groups: list[dict[str, Inner]]
+
+    nested = NestedContainers(groups=[{'a': Inner(x=1)}, {'b': Inner(y=2)}])
+    assert nested.model_fields_set_paths() == [
+        ('groups',),
+        ('groups', 0, 'a', 'x'),
+        ('groups', 1, 'b', 'y'),
+    ]
+
+    # Tuples, sets and plain custom objects are not traversed.
+    class Plain:
+        def __init__(self):
+            self.inner = Inner(x=1)
+
+    class WithLeaves(BaseModel):
+        t: tuple[Inner, ...]
+        s: set[int] = set()
+        p: object = None
+
+    leaves = WithLeaves(t=(Inner(x=1),), s={1}, p=Plain())
+    assert leaves.model_fields_set_paths() == [('t',), ('s',), ('p',)]
+
+
+def test_fields_set_paths_shared_instances():
+    class Inner(BaseModel):
+        x: int = 1
+
+    class Shared(BaseModel):
+        first: Inner
+        second: Inner
+
+    shared = Inner(x=7)
+    m = Shared(first=shared, second=shared)
+    # The same instance referenced twice is reported once per reference.
+    assert m.model_fields_set_paths() == [
+        ('first',),
+        ('first', 'x'),
+        ('second',),
+        ('second', 'x'),
+    ]
+
+    class Diamond(BaseModel):
+        nodes: list[Inner]
+
+    diamond = Diamond(nodes=[shared, shared])
+    assert diamond.model_fields_set_paths() == [
+        ('nodes',),
+        ('nodes', 0, 'x'),
+        ('nodes', 1, 'x'),
+    ]
+
+
+def test_fields_set_paths_circular_reference():
+    class Node(BaseModel):
+        value: int = 0
+        child: Optional['Node'] = None
+
+    node = Node(value=1)
+    node.child = node
+    with pytest.raises(PydanticUserError) as exc_info:
+        node.model_fields_set_paths()
+    assert exc_info.value.code == 'circular-reference-fields-set-paths'
+    message = str(exc_info.value)
+    assert "('child',)" in message
+    assert '()' in message
+
+    # Cycles nested deeper mention the full repeated path.
+    other = Node(value=1)
+    other.child = Node()
+    other.child.child = other
+    with pytest.raises(PydanticUserError, match=r"\('child', 'child'\)"):
+        other.model_fields_set_paths()
+
+    # Circular references through lists are also reported instead of recursing.
+    class ListHolder(BaseModel):
+        things: list = []
+
+    list_holder = ListHolder(things=[])
+    list_holder.things.append(list_holder)
+    with pytest.raises(PydanticUserError, match=r"\('things', 0\)"):
+        list_holder.model_fields_set_paths()
+
+    # Circular references through string keyed dictionaries are also reported.
+    class DictHolder(BaseModel):
+        things: dict = {}
+
+    dict_holder = DictHolder(things={})
+    dict_holder.things['back'] = dict_holder
+    with pytest.raises(PydanticUserError, match=r"\('things', 'back'\)"):
+        dict_holder.model_fields_set_paths()
+
+
+def test_fields_set_paths_assignment():
+    class Inner(BaseModel):
+        x: int = 1
+
+    class Model(BaseModel):
+        a: int = 1
+        inner: Inner = Inner()
+
+    m = Model()
+    assert m.model_fields_set_paths() == []
+
+    # Assigning the default value still marks the field as set.
+    m.a = 1
+    assert m.model_fields_set_paths() == [('a',)]
+
+    # Assignment on a nested default model is reported below the unset parent field.
+    m.inner.x = 1
+    assert m.model_fields_set_paths() == [('a',), ('inner', 'x')]
+
+    class ValidatedAssignment(BaseModel):
+        model_config = ConfigDict(validate_assignment=True)
+        a: int = 1
+
+    validated = ValidatedAssignment()
+    validated.a = 2
+    assert validated.model_fields_set_paths() == [('a',)]
+
+
+def test_fields_set_paths_model_copy_update():
+    class Inner(BaseModel):
+        x: int = 1
+        y: int = 2
+
+    class Model(BaseModel):
+        a: int = 0
+        inner: Inner = Inner()
+
+    # `model_copy(update=...)` marks updated fields as set, without revalidating.
+    copied = Model(a=1).model_copy(update={'a': 9})
+    assert copied.model_fields_set_paths() == [('a',)]
+
+    nested = Model().model_copy(update={'inner': Inner(y=3)})
+    assert nested.model_fields_set_paths() == [('inner',), ('inner', 'y')]
+
+    deep = Model(a=1).model_copy(deep=True, update={'inner': Inner(y=4)})
+    assert deep.model_fields_set_paths() == [('a',), ('inner',), ('inner', 'y')]
+    # The copy is independent of the instance passed through `update`.
+    deep.inner.y = 5
+    assert nested.model_fields_set_paths() == [('inner',), ('inner', 'y')]
+
+
+def test_fields_set_paths_uses_field_names_not_aliases():
+    class AliasModel(BaseModel):
+        my_field: int = Field(alias='myField', default=0)
+        serialized_field: int = Field(serialization_alias='serializedField', default=0)
+        choice_field: int = Field(validation_alias=AliasChoices('choiceField', 'choice'), default=0)
+
+    m = AliasModel.model_validate({'myField': 1, 'serialized_field': 2, 'choiceField': 3})
+    assert m.model_fields_set_paths() == [('my_field',), ('serialized_field',), ('choice_field',)]
+
+
+def test_fields_set_paths_ignores_private_and_computed_fields():
+    class Model(BaseModel):
+        a: int = 1
+        _private: int = PrivateAttr(default=0)
+
+        @computed_field
+        def doubled(self) -> int:
+            return self.a * 2
+
+    m = Model(a=2)
+    assert m.model_fields_set_paths() == [('a',)]
+
+    # Private attributes and computed fields never appear as paths.
+    m._private = 3
+    assert m.model_fields_set_paths() == [('a',)]
+
+
+def test_fields_set_paths_does_not_mutate_model():
+    class Inner(BaseModel):
+        x: int = 1
+
+    class Model(BaseModel):
+        a: int = 0
+        inner: Inner
+        items: list[Inner]
+
+    m = Model(a=1, inner=Inner(x=2), items=[Inner(x=3)])
+    before = (m.__dict__.copy(), set(m.model_fields_set), set(m.inner.model_fields_set))
+
+    assert m.model_fields_set_paths() == [
+        ('a',),
+        ('inner',),
+        ('inner', 'x'),
+        ('items',),
+        ('items', 0, 'x'),
+    ]
+
+    after = (m.__dict__.copy(), set(m.model_fields_set), set(m.inner.model_fields_set))
+    assert before == after
 
 
 def test_exclude_unset_dict():

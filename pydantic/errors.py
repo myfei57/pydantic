@@ -44,6 +44,7 @@ PydanticErrorCodes = Literal[
     'config-both',
     'removed-kwargs',
     'circular-reference-schema',
+    'circular-reference-fields-set-paths',
     'invalid-for-json-schema',
     'json-schema-already-used',
     'base-model-instantiated',

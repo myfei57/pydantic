@@ -214,6 +214,16 @@ def test_assignment():
     assert m.root == 2
 
 
+def test_fields_set_paths():
+    class Inner(BaseModel):
+        x: int = 1
+
+    m = RootModel[list[Inner]]([Inner(x=1), Inner()])
+    assert m.model_fields_set_paths() == [('root',), ('root', 0, 'x')]
+    m.root[0].x = 2
+    assert m.model_fields_set_paths() == [('root',), ('root', 0, 'x')]
+
+
 def test_model_validator_before():
     class Model(RootModel[int]):
         @model_validator(mode='before')

@@ -133,6 +133,65 @@ _SIMPLE_SETATTR_HANDLERS: Mapping[str, Callable[[BaseModel, str, Any], None]] = 
 }
 
 
+#: Path to an explicitly set field, across nested models, lists and string keyed dictionaries.
+_ModelFieldsSetPath: TypeAlias = tuple[str | int, ...]
+
+
+def _collect_model_fields_set_paths(
+    value: Any,
+    prefix: _ModelFieldsSetPath,
+    seen_on_path: dict[int, _ModelFieldsSetPath],
+    paths: list[_ModelFieldsSetPath],
+) -> None:
+    """Append the explicitly set field paths reachable from `value` to `paths`.
+
+    Only [`BaseModel`][pydantic.BaseModel] instances, lists and dictionaries are traversed.
+    `seen_on_path` maps the `id()` of containers on the current traversal path to the path
+    they were reached at, so that circular references raise instead of recursing forever.
+    The mapping is popped when leaving a container, so that shared (non cyclic) instances
+    are reported once per reference.
+    """
+    if not isinstance(value, (BaseModel, list, dict)):
+        return
+
+    value_id = id(value)
+    if value_id in seen_on_path:
+        raise PydanticUserError(
+            f'Circular reference detected while collecting paths of explicitly set fields: the '
+            f'{type(value).__name__} instance reached at path {prefix!r} was already encountered '
+            f'on the current path, at {seen_on_path[value_id]!r}.',
+            code='circular-reference-fields-set-paths',
+        )
+    seen_on_path[value_id] = prefix
+
+    try:
+        if isinstance(value, BaseModel):
+            fields_set = value.__pydantic_fields_set__
+            # Iterating `__pydantic_fields__` yields field names in declaration order, and field
+            # names (not aliases) are used as path components.
+            for field_name in type(value).__pydantic_fields__:
+                path = (*prefix, field_name)
+                if field_name in fields_set:
+                    paths.append(path)
+                # Descend into the current value even if the field itself was not explicitly set,
+                # so that fields set on nested default values are still reported.
+                try:
+                    field_value = value.__dict__[field_name]
+                except KeyError:
+                    continue
+                _collect_model_fields_set_paths(field_value, path, seen_on_path, paths)
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                _collect_model_fields_set_paths(item, (*prefix, index), seen_on_path, paths)
+        else:
+            # Only dictionaries with string keys are traversed, using the raw key:
+            for key, item in value.items():
+                if isinstance(key, str):
+                    _collect_model_fields_set_paths(item, (*prefix, key), seen_on_path, paths)
+    finally:
+        del seen_on_path[value_id]
+
+
 class BaseModel(metaclass=_model_construction.ModelMetaclass):
     """!!! abstract "Usage Documentation"
         [Models](../concepts/models.md)
@@ -329,6 +388,61 @@ class BaseModel(metaclass=_model_construction.ModelMetaclass):
                 i.e. that were not filled from defaults.
         """
         return self.__pydantic_fields_set__
+
+    def model_fields_set_paths(self) -> list[tuple[str | int, ...]]:
+        """Return the paths of the fields explicitly set on this model and its nested models.
+
+        This is a nested view over the [`model_fields_set`][pydantic.BaseModel.model_fields_set]
+        attribute of every model reached while traversing the field values:
+
+        * one path is returned for each explicitly set model field, even if its value is `None`
+            or equal to the field default;
+        * model fields are represented by their field name (never by their alias), list items by
+            their integer index, and string keyed dictionary entries by their raw key;
+        * paths are ordered following field declaration order, in a pre-order traversal.
+
+        Field values are traversed recursively through nested models, lists and string keyed
+        dictionaries. A nested model is traversed even when the field pointing to it was not
+        explicitly set on the parent model, so that fields explicitly set on default nested
+        values are not omitted. Other objects (e.g. tuples, sets and plain custom objects),
+        private attributes and computed fields are not traversed.
+
+        The returned paths describe the *current* state of the involved model instances, not the
+        data originally provided during validation. In particular, assigning to a field or copying
+        a model with [`model_copy(update=...)`][pydantic.BaseModel.model_copy] marks fields as set,
+        and this is reflected here. The same model instance referenced from multiple locations is
+        reported once for each reference; a circular reference on the current traversal path raises
+        a [`PydanticUserError`][pydantic.errors.PydanticUserError] indicating the path instead of
+        recursing indefinitely.
+
+        This method does not run validators or serializers and does not mutate the model.
+
+        Returns:
+            The paths of the explicitly set fields, as tuples of field names, list indices and
+                string dictionary keys.
+
+        ```python
+        from pydantic import BaseModel
+
+        class Inner(BaseModel):
+            x: int = 1
+            y: int | None = None
+
+        class Outer(BaseModel):
+            name: str
+            inner: Inner = Inner()
+            tags: list[Inner] = []
+
+        outer = Outer(name='a', tags=[Inner(x=2)])
+        outer.inner.y = None  # assignment marks the field as set, even with the default value
+
+        print(outer.model_fields_set_paths())
+        #> [('name',), ('inner', 'y'), ('tags',), ('tags', 0, 'x')]
+        ```
+        """
+        paths: list[_ModelFieldsSetPath] = []
+        _collect_model_fields_set_paths(self, (), {}, paths)
+        return paths
 
     @classmethod
     def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:  # noqa: C901
