@@ -36,10 +36,19 @@ from __future__ import annotations as _annotations
 
 import dataclasses as _dataclasses
 import re
+from collections.abc import Sequence
 from dataclasses import fields
 from functools import lru_cache
 from importlib.metadata import version
-from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
+from ipaddress import (
+    IPv4Address,
+    IPv4Interface,
+    IPv4Network,
+    IPv6Address,
+    IPv6Interface,
+    IPv6Network,
+    ip_network,
+)
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, TypeAlias, overload
 
 from pydantic_core import (
@@ -79,6 +88,7 @@ __all__ = [
     'WebsocketUrl',
     'AnyWebsocketUrl',
     'UrlConstraints',
+    'NetworkConstraints',
     'EmailStr',
     'NameEmail',
     'IPvAnyAddress',
@@ -153,6 +163,186 @@ class UrlConstraints:
         for constraint_key, constraint_value in self.defined_constraints.items():
             schema_to_mutate[constraint_key] = constraint_value
         return schema
+
+
+NetworkConfigType: TypeAlias = 'str | IPv4Network | IPv6Network'
+
+
+def _parse_configured_networks(
+    networks: Sequence[NetworkConfigType] | None, field_name: str
+) -> tuple[IPv4Network | IPv6Network, ...] | None:
+    """Parse and normalize the CIDR networks configured on a [`NetworkConstraints`][pydantic.networks.NetworkConstraints].
+
+    The networks are parsed in strict mode, so invalid CIDRs and non canonical networks with host
+    bits set raise an error immediately, rather than when a value happens to be validated.
+
+    Args:
+        networks: The configured networks, or `None` when the constraint was not provided.
+        field_name: The name of the `NetworkConstraints` field being parsed, used in error messages.
+
+    Returns:
+        A tuple of normalized, de-duplicated networks, or `None` when `networks` was `None`.
+    """
+    if networks is None:
+        return None
+
+    normalized: dict[str, IPv4Network | IPv6Network] = {}
+    for network in networks:
+        if isinstance(network, (IPv4Network, IPv6Network)):
+            parsed_network = network
+        elif isinstance(network, str):
+            try:
+                # strict parsing (the default for `ip_network`) rejects CIDRs with host bits set
+                parsed_network = ip_network(network)
+            except ValueError as exc:
+                raise PydanticUserError(
+                    f"'{network}' is not a valid canonical CIDR network for `NetworkConstraints.{field_name}`: {exc}",
+                    code=None,
+                ) from exc
+        else:
+            raise PydanticUserError(
+                'Networks used in `NetworkConstraints` must be CIDR strings or `ipaddress` network '
+                f'objects, got {network!r} of type {type(network).__name__} for '
+                f'`NetworkConstraints.{field_name}`.',
+                code=None,
+            )
+        normalized.setdefault(str(parsed_network), parsed_network)
+    return tuple(normalized.values())
+
+
+@_dataclasses.dataclass(frozen=True)
+class NetworkConstraints:
+    """Constraints for IP address fields based on membership in allowed / denied networks (CIDRs).
+
+    This annotation can be applied to [`IPv4Address`][ipaddress.IPv4Address],
+    [`IPv6Address`][ipaddress.IPv6Address] and [`IPvAnyAddress`][pydantic.networks.IPvAnyAddress]
+    fields. The regular address parsing still happens first, and only afterwards is the resulting
+    address checked against the configured networks:
+
+    * Addresses that are members of any network in `denied_networks` are rejected. Denied networks
+      take precedence over allowed networks.
+    * When `allowed_networks` is provided, the address must be a member of one of those networks.
+      When it is not provided (`None`), all addresses are allowed. An explicitly empty list means
+      that no address is allowed.
+    * IPv4 and IPv6 networks are matched separately against the family of the validated address.
+    * The network and broadcast addresses of a network are considered members, e.g. both
+      `192.168.0.0` and `192.168.0.255` are members of `192.168.0.0/24`.
+
+    Invalid CIDRs, or non canonical networks that have host bits set (such as `192.168.0.1/24`),
+    raise a [`PydanticUserError`][pydantic.PydanticUserError] when the model or
+    [`TypeAdapter`][pydantic.TypeAdapter] is built. Successful validation returns the original
+    address object, while failures raise a dedicated `ip_address_denied` /
+    `ip_address_not_allowed` error.
+
+    Attributes:
+        allowed_networks: The CIDR networks that addresses are allowed to belong to. `None` (the
+            default) does not restrict the allowed range; an explicitly empty sequence forbids
+            every address.
+        denied_networks: The CIDR networks that always cause an address to be rejected, even when
+            it is part of an allowed network.
+
+    Example:
+        ```python
+        from typing import Annotated
+        from ipaddress import IPv4Address
+
+        from pydantic import BaseModel, ValidationError
+        from pydantic.networks import NetworkConstraints
+
+        class Model(BaseModel):
+            address: Annotated[
+                IPv4Address,
+                NetworkConstraints(
+                    allowed_networks=['10.0.0.0/8'],
+                    denied_networks=['10.1.0.0/16'],
+                ),
+            ]
+
+        print(Model(address='10.0.0.1').address)
+        #> 10.0.0.1
+
+        try:
+            Model(address='10.1.0.1')
+        except ValidationError as exc:
+            print(exc.errors()[0]['type'])
+        #> ip_address_denied
+
+        try:
+            Model(address='192.168.0.1')
+        except ValidationError as exc:
+            print(exc.errors()[0]['type'])
+        #> ip_address_not_allowed
+        ```
+    """
+
+    allowed_networks: Sequence[NetworkConfigType] | None = None
+    denied_networks: Sequence[NetworkConfigType] | None = None
+
+    def __post_init__(self) -> None:
+        # copy the provided sequences into immutable tuples so the dataclass stays hashable
+        if self.allowed_networks is not None:
+            object.__setattr__(self, 'allowed_networks', tuple(self.allowed_networks))
+        if self.denied_networks is not None:
+            object.__setattr__(self, 'denied_networks', tuple(self.denied_networks))
+
+    def __get_pydantic_core_schema__(self, source: Any, handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
+        if source is not IPv4Address and source is not IPv6Address and source is not IPvAnyAddress:
+            raise PydanticUserError(
+                f"'NetworkConstraints' cannot annotate '{getattr(source, '__name__', source)}'.",
+                code='invalid-annotated-type',
+            )
+
+        schema = handler(source)
+
+        allowed = _parse_configured_networks(self.allowed_networks, 'allowed_networks')
+        denied = _parse_configured_networks(self.denied_networks, 'denied_networks')
+
+        allowed_v4 = tuple(network for network in (allowed or ()) if isinstance(network, IPv4Network))
+        allowed_v6 = tuple(network for network in (allowed or ()) if isinstance(network, IPv6Network))
+        denied_v4 = tuple(network for network in (denied or ()) if isinstance(network, IPv4Network))
+        denied_v6 = tuple(network for network in (denied or ()) if isinstance(network, IPv6Network))
+
+        def validate_address(address: IPv4Address | IPv6Address) -> IPv4Address | IPv6Address:
+            if isinstance(address, IPv4Address):
+                family_allowed, family_denied = allowed_v4, denied_v4
+            else:
+                family_allowed, family_denied = allowed_v6, denied_v6
+
+            for network in family_denied:
+                if address in network:
+                    raise PydanticCustomError(
+                        'ip_address_denied',
+                        'IP address {ip} belongs to the denied network {network}',
+                        {'ip': str(address), 'network': str(network)},
+                    )
+
+            # `allowed is None` means the allowed range is unrestricted; an explicitly empty
+            # collection of matching-family networks means nothing can pass.
+            if allowed is not None and not any(address in network for network in family_allowed):
+                raise PydanticCustomError(
+                    'ip_address_not_allowed',
+                    'IP address {ip} is not a member of any allowed network',
+                    {'ip': str(address)},
+                )
+
+            return address
+
+        return core_schema.no_info_after_validator_function(validate_address, schema)
+
+    def __get_pydantic_json_schema__(
+        self, core_schema: core_schema.CoreSchema, handler: _schema_generation_shared.GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        # generating the inner schema preserves the original address `format` (ipv4 / ipv6 / ...)
+        json_schema = handler(core_schema)
+
+        if self.allowed_networks is not None:
+            allowed = _parse_configured_networks(self.allowed_networks, 'allowed_networks')
+            json_schema['allowedNetworks'] = [str(network) for network in (allowed or ())]
+        if self.denied_networks is not None:
+            denied = _parse_configured_networks(self.denied_networks, 'denied_networks')
+            json_schema['deniedNetworks'] = [str(network) for network in (denied or ())]
+
+        return json_schema
 
 
 class _BaseUrl:
